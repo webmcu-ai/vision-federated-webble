@@ -1,0 +1,707 @@
+```html
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vision Federation WebBLE Hub</title>
+
+<style>
+body {
+  font-family: monospace;
+  margin: 20px;
+  max-width: 1000px;
+}
+
+h2, h3 {
+  margin-bottom: 8px;
+}
+
+input[type="button"] {
+  font-family: monospace;
+  margin: 3px;
+  padding: 6px 10px;
+}
+
+#myDevices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.myCard {
+  border: 1px solid #999;
+  padding: 12px;
+  width: 280px;
+  background: #f7f7f7;
+}
+
+.myCard h3 {
+  margin-top: 0;
+}
+
+.myState {
+  font-size: 16px;
+  font-weight: bold;
+  margin: 8px 0;
+}
+
+.myGood {
+  color: green;
+}
+
+.myWarn {
+  color: #996600;
+}
+
+.myBad {
+  color: red;
+}
+
+pre {
+  background: #eee;
+  padding: 10px;
+  overflow-x: auto;
+}
+
+#myLog {
+  background: #111;
+  color: #0f0;
+  padding: 10px;
+  height: 180px;
+  overflow-y: scroll;
+  font-size: 12px;
+}
+</style>
+</head>
+
+<body>
+
+<h2>Vision Federation WebBLE Hub v001</h2>
+
+<p>
+Connect several XIAO vision nodes and watch the local Edge AI network.
+Each XIAO trains its own model. The XIAOs perform the federated
+learning directly between themselves.
+</p>
+
+<p>
+<input type="button" value="Add XIAO" onclick="myConnect()">
+<input type="button" value="Refresh All" onclick="myRefreshAll()">
+<input type="button" value="Disconnect All" onclick="myDisconnectAll()">
+</p>
+
+<h3>Federated Learning</h3>
+
+<pre id="myFedInfo">No XIAO nodes connected yet.
+
+The intended flow is:
+
+1. Each XIAO collects local images.
+2. Each XIAO trains locally.
+3. XIAOs discover nearby peers.
+4. One XIAO becomes coordinator.
+5. Local models are pulled together.
+6. FedAvg creates a shared model.
+7. The shared model is pushed back to the peers.
+8. Nodes continue with inference.
+
+The browser is the monitor and control panel.
+The XIAOs perform the federation.</pre>
+
+<h3>Connected Edge AI Nodes</h3>
+
+<div id="myDevices"></div>
+
+<h3>Activity Log</h3>
+
+<div id="myLog"></div>
+
+<script>
+
+// ============================================================
+// BLE UUIDs - MUST MATCH the v006 .ino
+// ============================================================
+
+var mySERVICE_UUID =
+  "6e400001-a1b2-4c3d-9e5f-8a2b6c7d9e1f";
+
+var myCONTROL_CHAR_UUID =
+  "6e400002-a1b2-4c3d-9e5f-8a2b6c7d9e1f";
+
+var myDATA_CHAR_UUID =
+  "6e400003-a1b2-4c3d-9e5f-8a2b6c7d9e1f";
+
+var myBINARY_CHAR_UUID =
+  "6e400004-a1b2-4c3d-9e5f-8a2b6c7d9e1f";
+
+
+// ============================================================
+// Connected nodes
+// ============================================================
+
+var myNodes = [];
+
+
+// ============================================================
+// Logging
+// ============================================================
+
+function myLog(text) {
+
+  var box = document.getElementById("myLog");
+
+  var line = document.createElement("div");
+
+  line.textContent =
+    "[" + new Date().toLocaleTimeString() + "] " + text;
+
+  box.appendChild(line);
+
+  box.scrollTop = box.scrollHeight;
+}
+
+
+// ============================================================
+// Add one XIAO
+// ============================================================
+
+async function myConnect() {
+
+  try {
+
+    if (!navigator.bluetooth) {
+      myLog("Web Bluetooth is not available in this browser.");
+      return;
+    }
+
+    myLog("Choose a nearby XIAO...");
+
+    var device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [mySERVICE_UUID] }]
+    });
+
+    // Do not add the same device twice.
+
+    for (var i = 0; i < myNodes.length; i++) {
+
+      if (myNodes[i].device.id == device.id) {
+
+        myLog("That XIAO is already connected.");
+        return;
+      }
+    }
+
+    var node = {
+
+      device: device,
+      server: null,
+      control: null,
+      data: null,
+      binary: null,
+
+      textChunks: [],
+      fileChunks: [],
+      filePullActive: false,
+
+      status: null,
+      list: null,
+
+      label: "Node " + (myNodes.length + 1)
+    };
+
+    myNodes.push(node);
+
+    device.addEventListener(
+      "gattserverdisconnected",
+      function() {
+        myDisconnected(node);
+      }
+    );
+
+    await myConnectNode(node);
+
+  } catch (err) {
+
+    myLog("Add XIAO failed: " + err);
+  }
+}
+
+
+// ============================================================
+// Connect selected XIAO
+// ============================================================
+
+async function myConnectNode(node) {
+
+  try {
+
+    myLog("Connecting to " + node.device.name + "...");
+
+    node.server = await node.device.gatt.connect();
+
+    var service =
+      await node.server.getPrimaryService(mySERVICE_UUID);
+
+    node.control =
+      await service.getCharacteristic(myCONTROL_CHAR_UUID);
+
+    node.data =
+      await service.getCharacteristic(myDATA_CHAR_UUID);
+
+    node.binary =
+      await service.getCharacteristic(myBINARY_CHAR_UUID);
+
+    await node.data.startNotifications();
+
+    node.data.addEventListener(
+      "characteristicvaluechanged",
+      function(event) {
+        myDataNotify(node, event);
+      }
+    );
+
+    myLog(node.label + " connected: " + node.device.name);
+
+    myDrawDevices();
+
+    await mySendCommand(node, "STATUS");
+    await mySendCommand(node, "LIST");
+
+  } catch (err) {
+
+    myLog(node.label + " connection failed: " + err);
+
+    myDrawDevices();
+  }
+}
+
+
+// ============================================================
+// Disconnect
+// ============================================================
+
+function myDisconnected(node) {
+
+  myLog(node.label + " disconnected.");
+
+  myDrawDevices();
+}
+
+
+// ============================================================
+// Send command
+// ============================================================
+
+async function mySendCommand(node, cmd) {
+
+  if (!node.control) {
+
+    myLog(node.label + " is not connected.");
+
+    return;
+  }
+
+  try {
+
+    await node.control.writeValue(
+      new TextEncoder().encode(cmd)
+    );
+
+    myLog(node.label + " -> " + cmd);
+
+  } catch (err) {
+
+    myLog(node.label + " command failed: " + err);
+  }
+}
+
+
+// ============================================================
+// Commands
+// ============================================================
+
+function myStatus(node) {
+  mySendCommand(node, "STATUS");
+}
+
+function myList(node) {
+  mySendCommand(node, "LIST");
+}
+
+function myTrain(node) {
+  mySendCommand(node, "CMD_START_TRAIN");
+}
+
+function myInfer(node) {
+  mySendCommand(node, "CMD_START_INFER");
+}
+
+function myStop(node) {
+  mySendCommand(node, "CMD_STOP");
+}
+
+function myCollect(node, classIndex) {
+
+  mySendCommand(
+    node,
+    "CMD_START_COLLECT:" + classIndex
+  );
+}
+
+
+// ============================================================
+// Receive notification
+// ============================================================
+
+function myDataNotify(node, event) {
+
+  var bytes =
+    new Uint8Array(event.target.value.buffer);
+
+  if (myIsEndMarker(bytes)) {
+
+    if (node.filePullActive) {
+      myFinishFile(node);
+    } else {
+      myFinishText(node);
+    }
+
+    return;
+  }
+
+  if (node.filePullActive) {
+
+    node.fileChunks.push(bytes);
+
+  } else {
+
+    node.textChunks.push(
+      new TextDecoder().decode(bytes)
+    );
+  }
+}
+
+
+// ============================================================
+// END marker
+// ============================================================
+
+function myIsEndMarker(bytes) {
+
+  if (bytes.length != 7) return false;
+
+  return new TextDecoder().decode(bytes) == "<<END>>";
+}
+
+
+// ============================================================
+// Finish text message
+// ============================================================
+
+function myFinishText(node) {
+
+  var text = node.textChunks.join("");
+
+  node.textChunks = [];
+
+  myLog(node.label + " <- " + text);
+
+  try {
+
+    var obj = JSON.parse(text);
+
+    if (obj.type == "status") {
+
+      node.status = obj;
+
+      myDrawDevices();
+    }
+
+    if (obj.type == "list") {
+
+      node.list = obj;
+
+      myDrawDevices();
+    }
+
+  } catch (err) {
+
+    myLog(node.label + ": non-JSON BLE message");
+  }
+}
+
+
+// ============================================================
+// Finish file - currently not used by the main dashboard
+// ============================================================
+
+function myFinishFile(node) {
+
+  node.filePullActive = false;
+
+  var total = 0;
+
+  for (var i = 0; i < node.fileChunks.length; i++) {
+    total += node.fileChunks[i].length;
+  }
+
+  var combined = new Uint8Array(total);
+
+  var offset = 0;
+
+  for (var j = 0; j < node.fileChunks.length; j++) {
+
+    combined.set(
+      node.fileChunks[j],
+      offset
+    );
+
+    offset += node.fileChunks[j].length;
+  }
+
+  node.fileChunks = [];
+
+  myLog(
+    node.label +
+    ": received " +
+    total +
+    " bytes"
+  );
+}
+
+
+// ============================================================
+// Draw all device cards
+// ============================================================
+
+function myDrawDevices() {
+
+  var box = document.getElementById("myDevices");
+
+  box.innerHTML = "";
+
+  if (myNodes.length == 0) {
+
+    box.innerHTML =
+      "<p>No XIAO nodes connected.</p>";
+
+    return;
+  }
+
+  for (var i = 0; i < myNodes.length; i++) {
+
+    myDrawNode(box, myNodes[i], i);
+  }
+}
+
+
+// ============================================================
+// Draw one device card
+// ============================================================
+
+function myDrawNode(box, node, index) {
+
+  var card = document.createElement("div");
+
+  card.className = "myCard";
+
+  var connected =
+    node.device.gatt &&
+    node.device.gatt.connected;
+
+  var status = node.status;
+
+  var html = "";
+
+  html += "<h3>" +
+    node.label +
+    "</h3>";
+
+  html += "<div>" +
+    (node.device.name || "Unnamed XIAO") +
+    "</div>";
+
+  if (connected) {
+
+    html +=
+      "<div class='myState myGood'>CONNECTED</div>";
+
+  } else {
+
+    html +=
+      "<div class='myState myBad'>DISCONNECTED</div>";
+  }
+
+
+  if (status) {
+
+    html += "<hr>";
+
+    html +=
+      "<div>SD card: " +
+      (status.sdCard ? "YES" : "NO") +
+      "</div>";
+
+    html +=
+      "<div>Model: " +
+      (status.weightsTrained ? "READY" : "NOT TRAINED") +
+      "</div>";
+
+    html +=
+      "<div>Classes: " +
+      status.numClasses +
+      "</div>";
+
+    html +=
+      "<div>Free heap: " +
+      status.freeHeap +
+      "</div>";
+
+    html +=
+      "<div>Free PSRAM: " +
+      status.freePsram +
+      "</div>";
+  }
+
+
+  if (node.list) {
+
+    html += "<hr>";
+
+    html += "<div><b>Local images</b></div>";
+
+    for (var i = 0; i < node.list.classes.length; i++) {
+
+      html +=
+        "<div>" +
+        node.list.classes[i].label +
+        ": " +
+        node.list.classes[i].count +
+        "</div>";
+    }
+  }
+
+
+  html += "<hr>";
+
+  html +=
+    "<input type='button' value='Status' " +
+    "onclick='myStatus(myNodes[" + index + "])'>";
+
+  html +=
+    "<input type='button' value='Images' " +
+    "onclick='myList(myNodes[" + index + "])'>";
+
+  html +=
+    "<input type='button' value='Train' " +
+    "onclick='myTrain(myNodes[" + index + "])'>";
+
+  html +=
+    "<input type='button' value='Infer' " +
+    "onclick='myInfer(myNodes[" + index + "])'>";
+
+  html +=
+    "<input type='button' value='Stop' " +
+    "onclick='myStop(myNodes[" + index + "])'>";
+
+
+  html += "<br><br>";
+
+  html +=
+    "<input type='button' value='Collect Blank' " +
+    "onclick='myCollect(myNodes[" + index + "],0)'>";
+
+  html +=
+    "<input type='button' value='Collect Cup' " +
+    "onclick='myCollect(myNodes[" + index + "],1)'>";
+
+  html +=
+    "<input type='button' value='Collect Pen' " +
+    "onclick='myCollect(myNodes[" + index + "],2)'>";
+
+
+  card.innerHTML = html;
+
+  box.appendChild(card);
+}
+
+
+// ============================================================
+// Refresh every connected node
+// ============================================================
+
+async function myRefreshAll() {
+
+  myLog("Refreshing all nodes...");
+
+  for (var i = 0; i < myNodes.length; i++) {
+
+    if (
+      myNodes[i].device.gatt &&
+      myNodes[i].device.gatt.connected
+    ) {
+
+      await mySendCommand(
+        myNodes[i],
+        "STATUS"
+      );
+
+      await new Promise(function(resolve) {
+        setTimeout(resolve, 100);
+      });
+
+      await mySendCommand(
+        myNodes[i],
+        "LIST"
+      );
+    }
+  }
+}
+
+
+// ============================================================
+// Disconnect everything
+// ============================================================
+
+function myDisconnectAll() {
+
+  for (var i = 0; i < myNodes.length; i++) {
+
+    if (
+      myNodes[i].device.gatt &&
+      myNodes[i].device.gatt.connected
+    ) {
+
+      myNodes[i].device.gatt.disconnect();
+    }
+  }
+
+  myLog("Disconnect requested for all nodes.");
+
+  myDrawDevices();
+}
+
+
+// ============================================================
+// Automatic dashboard refresh
+// ============================================================
+
+setInterval(function() {
+
+  myRefreshAll();
+
+}, 5000);
+
+
+// ============================================================
+// Initial display
+// ============================================================
+
+myDrawDevices();
+
+</script>
+
+</body>
+</html>
+```
