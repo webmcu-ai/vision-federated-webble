@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Vision Node WebBLE Hub</title>
+</head>
+<body style="font-family: monospace; margin: 20px; max-width: 700px;">
+
+<h2>XIAO Vision Node - WebBLE Hub - v001</h2>
+<p>Connects to ONE XIAO vision node (esp32-s3) over Bluetooth. Works in Chrome or Edge
+on desktop or Android (no Web Bluetooth on iOS Safari). Kept basic on purpose - a
+starting point to build on, matching <code>vision-ble-v001.ino</code>.</p>
+
+<!-- ============================================================ -->
+<!-- These MUST exactly match the #define UUIDs in the .ino file  -->
+<!-- ============================================================ -->
+<script>
+var mySERVICE_UUID      = "6e400001-a1b2-4c3d-9e5f-8a2b6c7d9e1f";
+var myCONTROL_CHAR_UUID  = "6e400002-a1b2-4c3d-9e5f-8a2b6c7d9e1f"; // Write:  browser -> node commands
+var myDATA_CHAR_UUID     = "6e400003-a1b2-4c3d-9e5f-8a2b6c7d9e1f"; // Notify: node -> browser
+var myBINARY_CHAR_UUID   = "6e400004-a1b2-4c3d-9e5f-8a2b6c7d9e1f"; // Write:  browser -> node, model upload
+
+var myDevice = null, myServer = null;
+var myControlChar = null, myDataChar = null, myBinaryChar = null;
+
+var myChunkBuf = [];          // accumulates text notify chunks until "<<END>>"
+var myFileChunks = [];        // accumulates raw byte chunks for a file pull until "<<END>>"
+var myFilePullActive = false;
+var myFilePullName = "myWeights.bin";
+var myNumClasses = 3;
+var myClassLabels = ["0Blank", "1Cup", "2Pen"];
+
+function myLog(text) {
+  var box = document.getElementById("myLog");
+  var line = document.createElement("div");
+  line.textContent = "[" + new Date().toLocaleTimeString() + "] " + text;
+  box.appendChild(line);
+  box.scrollTop = box.scrollHeight;
+}
+
+// ------------------------------------------------------------
+// Connect / disconnect
+// ------------------------------------------------------------
+async function myConnect() {
+  try {
+    myLog("Requesting device (filter: service " + mySERVICE_UUID + ")...");
+    myDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [mySERVICE_UUID] }]
+    });
+    myDevice.addEventListener("gattserverdisconnected", myOnDisconnected);
+
+    myLog("Connecting to GATT server on " + myDevice.name + "...");
+    myServer = await myDevice.gatt.connect();
+    var service = await myServer.getPrimaryService(mySERVICE_UUID);
+
+    myControlChar = await service.getCharacteristic(myCONTROL_CHAR_UUID);
+    myDataChar    = await service.getCharacteristic(myDATA_CHAR_UUID);
+    myBinaryChar  = await service.getCharacteristic(myBINARY_CHAR_UUID);
+
+    await myDataChar.startNotifications();
+    myDataChar.addEventListener("characteristicvaluechanged", myOnDataNotify);
+
+    document.getElementById("myConnBtn").textContent = "Connected: " + myDevice.name;
+    document.getElementById("myConnBtn").disabled = true;
+    myLog("Connected. Requesting STATUS...");
+    myRefreshStatus();
+  } catch (err) {
+    myLog("Connect failed: " + err);
+  }
+}
+
+function myOnDisconnected() {
+  myLog("Disconnected.");
+  document.getElementById("myConnBtn").textContent = "Connect";
+  document.getElementById("myConnBtn").disabled = false;
+}
+
+// ------------------------------------------------------------
+// Sending text commands (Control characteristic)
+// ------------------------------------------------------------
+async function mySendCommand(cmd) {
+  if (!myControlChar) { myLog("Not connected."); return; }
+  try {
+    myLog("-> " + cmd);
+    await myControlChar.writeValue(new TextEncoder().encode(cmd));
+  } catch (err) {
+    myLog("Send failed: " + err);
+  }
+}
+
+function myRefreshStatus()   { mySendCommand("STATUS"); }
+function myRefreshList()     { mySendCommand("LIST"); }
+function myStop()            { mySendCommand("CMD_STOP"); }
+function myCapture()         { mySendCommand("CMD_CAPTURE"); }
+function myStartTrain()      { mySendCommand("CMD_START_TRAIN"); }
+function myStartInfer()      { mySendCommand("CMD_START_INFER"); }
+function myStartCollect() {
+  var idx = document.getElementById("myClassSelect").value;
+  mySendCommand("CMD_START_COLLECT:" + idx);
+}
+function myPullWeights()     { myStartPull("/header/myWeights.bin"); }
+
+// ------------------------------------------------------------
+// Receiving Notify chunks (Data characteristic).
+// Text messages (STATUS/LIST/ack/error JSON) and raw file pulls
+// both use the same "<<END>>" terminator, so we branch on whether
+// a file pull is currently in progress.
+// ------------------------------------------------------------
+function myOnDataNotify(event) {
+  var bytes = new Uint8Array(event.target.value.buffer);
+
+  if (myIsEndMarker(bytes)) {
+    if (myFilePullActive) {
+      myFinishFilePull();
+    } else {
+      myFinishTextMessage();
+    }
+    return;
+  }
+
+  if (myFilePullActive) {
+    myFileChunks.push(bytes);
+  } else {
+    myChunkBuf.push(new TextDecoder().decode(bytes));
+  }
+}
+
+function myIsEndMarker(bytes) {
+  if (bytes.length !== 7) return false;
+  var s = new TextDecoder().decode(bytes);
+  return s === "<<END>>";
+}
+
+function myFinishTextMessage() {
+  var text = myChunkBuf.join("");
+  myChunkBuf = [];
+  myLog("<- " + text);
+  try {
+    var obj = JSON.parse(text);
+    if (obj.type === "status") {
+      myNumClasses = obj.numClasses;
+      myClassLabels = obj.classLabels;
+      myPopulateClassSelect();
+      document.getElementById("myStatusBox").textContent = JSON.stringify(obj, null, 2);
+    } else if (obj.type === "list") {
+      document.getElementById("myStatusBox").textContent = JSON.stringify(obj, null, 2);
+    }
+  } catch (err) {
+    // not JSON - just leave it in the log
+  }
+}
+
+function myPopulateClassSelect() {
+  var sel = document.getElementById("myClassSelect");
+  sel.innerHTML = "";
+  for (var i = 0; i < myClassLabels.length; i++) {
+    var opt = document.createElement("option");
+    opt.value = i;
+    opt.textContent = i + ": " + myClassLabels[i];
+    sel.appendChild(opt);
+  }
+}
+
+// ------------------------------------------------------------
+// File pull (e.g. PULL:/header/myWeights.bin) - downloads the
+// trained model as a browser file.
+// ------------------------------------------------------------
+function myStartPull(path) {
+  myFilePullActive = true;
+  myFileChunks = [];
+  myFilePullName = path.split("/").pop();
+  mySendCommand("PULL:" + path);
+}
+
+function myFinishFilePull() {
+  myFilePullActive = false;
+  var totalLen = myFileChunks.reduce(function (sum, c) { return sum + c.length; }, 0);
+  var combined = new Uint8Array(totalLen);
+  var offset = 0;
+  myFileChunks.forEach(function (c) { combined.set(c, offset); offset += c.length; });
+  myFileChunks = [];
+
+  var blob = new Blob([combined], { type: "application/octet-stream" });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url;
+  a.download = myFilePullName;
+  a.click();
+  URL.revokeObjectURL(url);
+  myLog("File pull complete: " + myFilePullName + " (" + totalLen + " bytes) - downloaded.");
+}
+
+// ------------------------------------------------------------
+// Model push (Binary characteristic) - uploads a myWeights.bin
+// file from disk to the node. First write is a 4-byte little-
+// endian size header, then raw chunks - must match the .ino's
+// MyBLEBinaryCallbacks parser exactly.
+// ------------------------------------------------------------
+async function myPushModel() {
+  if (!myBinaryChar) { myLog("Not connected."); return; }
+  var fileInput = document.getElementById("myModelFile");
+  if (!fileInput.files.length) { myLog("Choose a myWeights.bin file first."); return; }
+
+  var file = fileInput.files[0];
+  var buf = new Uint8Array(await file.arrayBuffer());
+  var total = buf.length;
+
+  myLog("Pushing model: " + file.name + " (" + total + " bytes)...");
+
+  var header = new Uint8Array(4);
+  header[0] = total & 0xFF;
+  header[1] = (total >> 8) & 0xFF;
+  header[2] = (total >> 16) & 0xFF;
+  header[3] = (total >> 24) & 0xFF;
+  await myBinaryChar.writeValue(header);
+
+  var chunkSize = 180;
+  for (var offset = 0; offset < total; offset += chunkSize) {
+    var chunk = buf.slice(offset, Math.min(offset + chunkSize, total));
+    await myBinaryChar.writeValue(chunk);
+    await new Promise(function (r) { setTimeout(r, 15); }); // pace to match firmware's notify delay
+  }
+  myLog("Model push finished sending " + total + " bytes. Watch log for node's ack/error.");
+}
+</script>
+
+<p>
+  <button id="myConnBtn" onclick="myConnect()">Connect</button>
+  <button onclick="myRefreshStatus()">Status</button>
+  <button onclick="myRefreshList()">List Image Counts</button>
+</p>
+
+<p>
+  Class:
+  <select id="myClassSelect">
+    <option value="0">0: 0Blank</option>
+    <option value="1">1: 1Cup</option>
+    <option value="2">2: 2Pen</option>
+  </select>
+  <button onclick="myStartCollect()">Start Collect</button>
+  <button onclick="myCapture()">Capture</button>
+
+  <button onclick="myStartTrain()">Start Train</button>
+  <button onclick="myStartInfer()">Start Infer</button>
+  <button onclick="myStop()">Stop/to Menu</button>
+</p>
+
+<p>
+  Model file: <input type="file" id="myModelFile" accept=".bin">
+  <button onclick="myPushModel()">Push Model to Node</button>
+  <button onclick="myPullWeights()">Pull Model from Node</button>
+</p>
+
+<h3>Status / List</h3>
+<pre id="myStatusBox" style="background:#f0f0f0; padding:10px; min-height:40px;"></pre>
+
+<h3>Log</h3>
+<div id="myLog" style="background:#111; color:#0f0; padding:10px; height:220px; overflow-y:scroll; font-size:12px;"></div>
+
+</body>
+</html>
